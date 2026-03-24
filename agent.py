@@ -43,16 +43,117 @@ MODELS = {
 # ── smart routing ─────────────────────────────────
 TOOL_KEYWORDS = [
     "search", "find", "look up", "google", "what time", "when do",
-    "when is", "weather", "news", "latest", "schedule", "score",
-    "price", "stock", "fetch", "download", "read file", "write file",
+    "when is", "when does", "when are", "who do", "who is playing",
+    "who plays", "who won", "what happened", "what is the score",
+    "weather", "news", "latest", "schedule", "score", "tonight",
+    "today", "tomorrow", "yesterday", "this week", "next game",
+    "play next", "playing next", "results", "standings",
+    "price", "stock", "market", "crypto", "bitcoin",
+    "fetch", "download", "read file", "write file",
     "create file", "run", "execute", "list files", "show me",
     "open", "browse", "url", "http", "website",
+    "how much", "where is", "directions", "recipe",
+    "explore", "repo", "repository", "github", "tell me more",
+    "more about", "what else", "continue", "go deeper",
 ]
 
 def needs_tools(message):
     """Detect if a message likely needs web search or tool use."""
     lower = message.lower()
     return any(kw in lower for kw in TOOL_KEYWORDS)
+
+# File operations still need PicoClaw
+FILE_KEYWORDS = ["read file", "write file", "write a file", "create file", "create a file",
+                  "create a new", "save file", "save to ", "save this",
+                  "list files", "list dir", "execute", "run ", "edit file",
+                  "open file", "delete file", "mkdir", "make dir"]
+
+def needs_picoclaw(message):
+    """Only use PicoClaw for file/exec operations. Web search is faster direct."""
+    lower = message.lower()
+    return any(kw in lower for kw in FILE_KEYWORDS)
+
+def llm_call(messages, max_tokens=300, temperature=0.1):
+    """Single LLM call, returns content + timings."""
+    payload = json.dumps({
+        "model": "local",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }).encode()
+    req = urllib.request.Request(
+        f"{SERVER}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    d = json.loads(urllib.request.urlopen(req, timeout=60).read())
+    return d["choices"][0]["message"]["content"], d.get("timings", {})
+
+def quick_search(query):
+    """LLM rewrites query → DuckDuckGo search → LLM answers. ~5-8s total."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return None
+
+    from datetime import datetime
+    today = datetime.now().strftime("%A, %B %d, %Y")
+
+    # Step 1: LLM rewrites query into optimal search terms (~1s)
+    try:
+        search_query, _ = llm_call([
+            {"role": "system", "content": f"Today is {today}. Rewrite the user's question into a short, optimal web search query. Include today's date if time-sensitive. Output ONLY the search query string, nothing else."},
+            {"role": "user", "content": query},
+        ], max_tokens=30, temperature=0.0)
+        search_query = search_query.strip().strip('"\'')
+    except Exception:
+        search_query = query
+
+    # Step 2: DuckDuckGo search (~0.2s)
+    try:
+        results = DDGS().text(search_query, max_results=5)
+    except Exception:
+        return None
+
+    if not results:
+        return None
+
+    # Step 2b: Fetch the most relevant page for detailed content (~1-2s)
+    search_text = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+    page_content = ""
+
+    try:
+        # Fetch the first result's URL for detailed data
+        best_url = results[0].get("href") or results[0].get("link", "")
+        if best_url:
+            req = urllib.request.Request(best_url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+            })
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = resp.read(8000).decode("utf-8", errors="ignore")
+                # Strip HTML tags for a rough text extraction
+                import re as _re
+                text = _re.sub(r'<[^>]+>', ' ', raw)
+                text = _re.sub(r'\s+', ' ', text).strip()
+                page_content = text[:3000]
+    except Exception:
+        pass  # page fetch failed, use snippets only
+
+    # Combine snippets + page content
+    context = f"Search snippets:\n{search_text}"
+    if page_content:
+        context += f"\n\nDetailed page content from {results[0]['title']}:\n{page_content}"
+
+    # Step 3: LLM answers using results (~2-3s)
+    content, timings = llm_call([
+        {"role": "system", "content": f"Today is {today}. Answer the user's question using the search results and page content below. Be specific, direct, and detailed. Use scores, dates, names, numbers, and facts. If you find the data, present it clearly."},
+        {"role": "user", "content": f"{context}\n\nQuestion: {query}"},
+    ], max_tokens=1000)
+
+    return content, timings.get("predicted_per_second", 0)
 
 def get_current_model():
     """Check which model the running server has loaded."""
@@ -700,7 +801,10 @@ def main():
                 for line in response.split("\n"):
                     console.print(f"  {line}")
                 console.print()
-                render_speed(len(response.split()), elapsed)
+                s = Text()
+                s.append(f"  ▸ agent", style="bold bright_cyan")
+                s.append(f"  {elapsed:.1f}s total (search + inference)", style="dim")
+                console.print(s)
                 session_tokens += len(response.split())
                 session_time += elapsed
             console.print()
@@ -793,81 +897,109 @@ def main():
                     console.print(f"  [bold red]{msg}[/]\n")
 
             elif auto_route and not use_tools and current == "9b":
-                # Check if 35B model exists before trying to swap
-                if os.path.exists(MODELS["35b"]["path"]):
-                    console.print("  [dim italic]routing to 35B (faster reasoning)...[/]")
-                    display = WorkingDisplay()
-                    display.phase = "swapping to 35B"
-                    with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                        ok, msg = swap_model("35b")
-                        while not ok and display.frame < 100:
-                            display.frame += 1
-                            live.update(display.render())
-                            time.sleep(0.2)
-                    if ok:
-                        model_name = MODELS["35b"]["name"]
-                        model_detail = MODELS["35b"]["detail"]
-                        console.print(f"  [dim]{msg}[/]\n")
+                # Stay on 9B — auto-swap to 35B is disabled on 16GB
+                # (35B crashes from memory pressure after a few queries)
+                # Users can manually swap with /model 35b if they want
+                pass
 
             # Now run the query
-            if use_tools:
-                # Use PicoClaw agent (tools enabled)
+            if use_tools and needs_picoclaw(user_input):
+                # File/exec operations → PicoClaw (slow but necessary)
                 picoclaw_response, events = picoclaw_call_live(user_input, session=session_id)
                 elapsed = time.time() - start
+                if picoclaw_response and "max_tool_iterations" not in picoclaw_response:
+                    render_timeline(events)
+                    console.print()
+                    for line in picoclaw_response.split("\n"):
+                        console.print(f"  {line}")
+                    console.print()
+                    s = Text()
+                    s.append(f"  ▸ agent", style="bold bright_cyan")
+                    s.append(f"  {elapsed:.1f}s", style="dim")
+                    console.print(s)
+                    session_tokens += len(picoclaw_response.split())
+                    session_time += elapsed
+                    session_turns += 1
+                else:
+                    console.print(f"  [bold red]agent failed[/]\n")
 
-                is_error = (
-                    not picoclaw_response
-                    or "max_tool_iterations" in picoclaw_response
-                    or "error processing" in picoclaw_response.lower()
-                    or picoclaw_response.startswith("[agent error]")
-                )
+            elif use_tools:
+                # Web search → fast direct path (~3-5s)
+                display = WorkingDisplay()
+                display.phase = "searching the web"
+                search_result = [None]
 
-                if is_error:
-                    # Fallback: stream from LLM directly
-                    direct_msgs = list(messages) if messages else []
-                    direct_msgs.append({"role": "user", "content": user_input})
+                def do_search():
+                    try:
+                        search_result[0] = quick_search(user_input)
+                    except Exception:
+                        search_result[0] = None
+
+                search_thread = threading.Thread(target=do_search, daemon=True)
+                search_thread.start()
+
+                with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
+                    while search_thread.is_alive():
+                        display.frame += 1
+                        t = time.time() - start
+                        if t < 2:
+                            display.phase = "rewriting query"
+                        elif t < 4:
+                            display.phase = "searching the web"
+                        elif t < 6:
+                            display.phase = "reading results"
+                        else:
+                            display.phase = "generating answer"
+                        live.update(display.render())
+                        time.sleep(0.12)
+
+                search_thread.join(timeout=1)
+                result = search_result[0]
+                elapsed = time.time() - start
+
+                if result:
+                    response, speed = result
+                    console.print()
+                    for line in response.split("\n"):
+                        console.print(f"  {line}")
+                    console.print()
+                    s = Text()
+                    s.append(f"  ▸ search", style="bold bright_cyan")
+                    s.append(f"  {elapsed:.1f}s", style="dim")
+                    if speed > 0:
+                        s.append(f"  ·  {speed:.1f} tok/s", style="bright_green")
+                    console.print(s)
+                    session_tokens += len(response.split())
+                    session_time += elapsed
+                    session_turns += 1
+                    messages.append({"role": "user", "content": user_input})
+                    messages.append({"role": "assistant", "content": response})
+                else:
+                    # Search failed, fall back to direct LLM
+                    console.print("  [dim]search failed, asking model directly...[/]")
+                    messages.append({"role": "user", "content": user_input})
                     full = ""
                     tokens = 0
                     first_token = True
-                    display = WorkingDisplay()
-                    display.phase = "thinking (fallback)"
-                    try:
-                        with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                            gen = stream_llm(direct_msgs)
-                            for chunk in gen:
-                                if isinstance(chunk, str):
-                                    if first_token:
-                                        first_token = False
-                                        live.stop()
-                                        console.print("  ", end="")
-                                    console.print(chunk, end="", highlight=False)
-                                    full += chunk
-                                    tokens += 1
-                        elapsed = time.time() - start
-                        console.print("\n")
-                        render_speed(tokens, elapsed)
-                        session_tokens += tokens
-                        session_time += elapsed
-                        session_turns += 1
-                        messages.append({"role": "user", "content": user_input})
-                        messages.append({"role": "assistant", "content": full})
-                    except Exception as e:
-                        console.print(f"\n  [bold red]{e}[/]")
-                else:
-                    # Clean PicoClaw response
-                    render_timeline(events)
-                    console.print()
-                    if not compact_mode and any(c in picoclaw_response for c in ["##", "**", "```", "- ", "1. ", "* "]):
-                        console.print(Padding(Markdown(picoclaw_response), (0, 2)))
-                    else:
-                        for line in picoclaw_response.split("\n"):
-                            console.print(f"  {line}")
-                    console.print()
-                    tokens_est = len(picoclaw_response.split())
-                    render_speed(tokens_est, elapsed)
-                    session_tokens += tokens_est
+                    display.phase = "thinking"
+                    with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
+                        gen = stream_llm(messages)
+                        for chunk in gen:
+                            if isinstance(chunk, str):
+                                if first_token:
+                                    first_token = False
+                                    live.stop()
+                                    console.print("  ", end="")
+                                console.print(chunk, end="", highlight=False)
+                                full += chunk
+                                tokens += 1
+                    elapsed = time.time() - start
+                    console.print("\n")
+                    render_speed(tokens, elapsed)
+                    session_tokens += tokens
                     session_time += elapsed
                     session_turns += 1
+                    messages.append({"role": "assistant", "content": full})
             else:
                 # Direct LLM streaming (no tools needed)
                 messages.append({"role": "user", "content": user_input})
@@ -889,11 +1021,7 @@ def main():
                                 full += chunk
                                 tokens += 1
                     elapsed = time.time() - start
-                    if not compact_mode and any(c in full for c in ["##", "**", "```", "- ", "1. "]):
-                        console.print("\n")
-                        console.print(Padding(Markdown(full), (0, 2)))
-                    else:
-                        console.print("\n")
+                    console.print("\n")
                     render_speed(tokens, elapsed)
                     session_tokens += tokens
                     session_time += elapsed

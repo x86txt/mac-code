@@ -371,7 +371,7 @@ const AGENT_URL = BACKEND_URL + '/api/agent';
 const DIRECT_LLM = 'http://localhost:8000/v1/chat/completions';
 let useBackend = false; // detected on boot
 
-const TOOL_KEYWORDS = ['search','find','look up','google','weather','news','latest','when do','when is','score','price','stock','schedule','what time'];
+const TOOL_KEYWORDS = ['search','find','look up','google','weather','news','latest','when do','when is','when does','who do','who is playing','who plays','who won','what happened','score','price','stock','schedule','what time','tonight','today','tomorrow','next game','play next','play','playing','explore','repo','repository','github','tell me more','more about','bitcoin','crypto','where is','recipe','results','standings','they play','next?'];
 function needsTools(msg){ return TOOL_KEYWORDS.some(k => msg.toLowerCase().includes(k)); }
 
 // State
@@ -448,8 +448,11 @@ async function askLLM(messages){
 }
 
 async function askAgent(message, session='web'){
-  const res=await fetch(AGENT_URL,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message, session})});
+  const res = await fetch(AGENT_URL, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({message, session}),
+  });
   return await res.json();
 }
 
@@ -480,29 +483,81 @@ async function handleInput(text){
   }
   if(lo==='/cost'){addHTML(`  <span style="color:#33ff33;font-weight:bold">$0.00</span> spent`);addLine('  ~$0.34/hr on cloud GPU','line-dim');addLine('');return;}
   if(lo==='/auto'){autoRoute=!autoRoute;addLine(`  auto-routing ${autoRoute?'on':'off'}`,'line-dim');addLine('');return;}
-  if(lo==='/model'){addLine(`  ${currentModel==='9b'?'Qwen3.5-9B (32K ctx)':'Qwen3.5-35B-A3B (8K ctx)'}`,'line-white line-bold');addLine('');return;}
+  if(lo==='/model 9b'||lo==='/model 35b'){
+    const target=lo.includes('9b')?'9b':'35b';
+    if(!useBackend){addLine('  swap requires server.py backend','line-error');addLine('');return;}
+    addLine(`  swapping to ${target==='9b'?'Qwen3.5-9B':'Qwen3.5-35B-A3B'}...`,'line-dim');
+    const iv=showLoading();
+    try{
+      const res=await fetch(BACKEND_URL+'/api/swap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:target})});
+      const d=await res.json();
+      hideLoading(iv);
+      if(d.ok){currentModel=target;addLine(`  ${d.message}`,'line-cyan');}
+      else{addLine(`  ${d.message||d.error}`,'line-error');}
+    }catch(e){hideLoading(iv);addLine(`  swap failed: ${e.message}`,'line-error');}
+    addLine('');return;
+  }
+  if(lo==='/model'){addLine(`  ${currentModel==='9b'?'Qwen3.5-9B (32K ctx)':'Qwen3.5-35B-A3B (8K ctx)'}`,'line-white line-bold');addLine(`  /model 9b or /model 35b to switch`,'line-dim');addLine('');return;}
   if(lo==='/quit'){addLine(`\n  mac code  ${sessionTurns} turns · ${sessionTokens} tokens`,'line-yellow');addLine('\n  Goodbye!','line-dim');input.disabled=true;return;}
 
-  // ── Route through agent (like agent.py) ──
+  // ── Route: 9B uses PicoClaw agent, 35B streams directly ──
   slashMenu.classList.remove('visible');
 
-  // When backend is available, ALWAYS use PicoClaw agent (like agent.py)
-  if(useBackend){
-    const iv=showLoading();
+  // 9B + backend → PicoClaw agent (tools work)
+  // 35B or no backend → stream directly from LLM (faster, no tools)
+  if(useBackend && currentModel==='9b'){
     const t0=performance.now();
+
+    // Show animated log area
+    const logDiv = document.createElement('div');
+    logDiv.className = 'line line-dim';
+    logDiv.id = 'agent-log';
+    logDiv.innerHTML = '  <span style="color:#00dddd">▸</span> <span style="color:#227722">starting agent...</span>';
+    terminal.appendChild(logDiv);
+    terminal.scrollTop = terminal.scrollHeight;
+
+    // Spinner above the log
+    let frame = 0;
+    const dots = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+    const spinDiv = document.createElement('div');
+    spinDiv.className = 'line line-cyan';
+    spinDiv.id = 'agent-spin';
+    terminal.insertBefore(spinDiv, logDiv);
+    const spinIv = setInterval(() => {
+      frame++;
+      const el = document.getElementById('agent-spin');
+      if (!el) { clearInterval(spinIv); return; }
+      const s = Math.floor(frame * 0.15);
+      el.innerHTML = `  ${dots[frame % dots.length]} working  ${s}s`;
+    }, 150);
+
     try{
-      const d=await askAgent(text);
-      hideLoading(iv);
-      const elapsed=((performance.now()-t0)/1000).toFixed(1);
-      const resp=d.response||d.error||'no response';
+      const d = await askAgent(text);
+
+      // Clean up spinner and log
+      clearInterval(spinIv);
+      const spin = document.getElementById('agent-spin');
+      if (spin) spin.remove();
+      const log = document.getElementById('agent-log');
+      if (log) log.remove();
+
+      const elapsed = ((performance.now()-t0)/1000).toFixed(1);
+      const resp = d.response || d.error || 'no response';
       addLine('');
-      resp.split('\n').forEach(line=>addLine('  '+line,'line-white'));
+      resp.split('\n').forEach(line => addLine('  '+line,'line-white'));
       addLine('');
-      const tokens=resp.split(/\s+/).length;
-      addHTML(`  <span style="color:#00dddd">▸ agent</span>  <span style="color:#227722">${elapsed}s total (search + inference)</span>`);
-      sessionTurns++;sessionTokens+=tokens;
+      const tokens = resp.split(/\s+/).length;
+      const method = d.method === 'fast' ? 'search' : 'agent';
+      const speed = d.speed ? ` · ${d.speed.toFixed(1)} tok/s` : '';
+      addHTML(`  <span style="color:#00dddd">▸ ${method}</span>  <span style="color:#227722">${elapsed}s${speed}</span>`);
+      sessionTurns++; sessionTokens += tokens;
     }catch(e){
-      hideLoading(iv);
+      clearInterval(spinIv);
+      const spin = document.getElementById('agent-spin');
+      if (spin) spin.remove();
+      const log = document.getElementById('agent-log');
+      if (log) log.remove();
+
       addLine(`\n  agent error: ${e.message}`,'line-error');
       addLine('  falling back to direct LLM...','line-dim');
       chatHistory.push({role:'user',content:text});
