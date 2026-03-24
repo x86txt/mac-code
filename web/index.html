@@ -364,7 +364,15 @@ const slashMenu = document.getElementById('slashMenu');
 const clock = document.getElementById('clock');
 const promptTag = document.getElementById('promptTag');
 
-const LLM_URL = 'http://localhost:8000/v1/chat/completions';
+// Use backend server if available (enables web search), fallback to direct llama-server
+const BACKEND_URL = 'http://localhost:8080';
+const LLM_URL = BACKEND_URL + '/api/chat';
+const AGENT_URL = BACKEND_URL + '/api/agent';
+const DIRECT_LLM = 'http://localhost:8000/v1/chat/completions';
+let useBackend = false; // detected on boot
+
+const TOOL_KEYWORDS = ['search','find','look up','google','weather','news','latest','when do','when is','score','price','stock','schedule','what time'];
+function needsTools(msg){ return TOOL_KEYWORDS.some(k => msg.toLowerCase().includes(k)); }
 
 // State
 let chatHistory = [];
@@ -425,15 +433,23 @@ function showSlash(filter='/'){
 }
 
 async function streamLLM(messages){
-  const res=await fetch(LLM_URL,{method:'POST',headers:{'Content-Type':'application/json'},
+  const url = useBackend ? LLM_URL : DIRECT_LLM;
+  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({model:'local',messages,max_tokens:2000,temperature:0.7,stream:true})});
   if(!res.ok)throw new Error(`Server ${res.status}`);
   return res.body.getReader();
 }
 
 async function askLLM(messages){
-  const res=await fetch(LLM_URL,{method:'POST',headers:{'Content-Type':'application/json'},
+  const url = useBackend ? LLM_URL : DIRECT_LLM;
+  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({model:'local',messages,max_tokens:2000,temperature:0.7})});
+  return await res.json();
+}
+
+async function askAgent(message, session='web'){
+  const res=await fetch(AGENT_URL,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message, session})});
   return await res.json();
 }
 
@@ -467,10 +483,41 @@ async function handleInput(text){
   if(lo==='/model'){addLine(`  ${currentModel==='9b'?'Qwen3.5-9B (32K ctx)':'Qwen3.5-35B-A3B (8K ctx)'}`,'line-white line-bold');addLine('');return;}
   if(lo==='/quit'){addLine(`\n  mac code  ${sessionTurns} turns · ${sessionTokens} tokens`,'line-yellow');addLine('\n  Goodbye!','line-dim');input.disabled=true;return;}
 
-  // ── Stream from real LLM ──
+  // ── Route: agent (tools) or direct LLM ──
   slashMenu.classList.remove('visible');
+
+  // If it needs tools and backend is available, use PicoClaw agent
+  if(useBackend && needsTools(text)){
+    const iv=showLoading();
+    const t0=performance.now();
+    try{
+      const d=await askAgent(text);
+      hideLoading(iv);
+      const elapsed=((performance.now()-t0)/1000).toFixed(1);
+      const resp=d.response||d.error||'no response';
+      addLine('');
+      resp.split('\n').forEach(line=>addLine('  '+line,'line-white'));
+      addLine('');
+      const tokens=resp.split(/\s+/).length;
+      const speed=(tokens/parseFloat(elapsed)).toFixed(1);
+      addHTML(`  <span style="color:#00dddd">▸ agent</span> <span style="color:#227722">${elapsed}s via PicoClaw</span>`);
+      sessionTurns++;sessionTokens+=tokens;
+    }catch(e){
+      hideLoading(iv);
+      addLine(`\n  agent error: ${e.message}`,'line-error');
+      addLine('  falling back to direct LLM...','line-dim');
+      // Fall through to streaming below
+      chatHistory.push({role:'user',content:text});
+      await streamDirect();
+    }
+    addLine('');
+    return;
+  }
+
+  // Direct LLM streaming
   chatHistory.push({role:'user',content:text});
 
+  async function streamDirect(){
   const iv=showLoading();
   const t0=performance.now();
   let full='',tokens=0;
@@ -519,6 +566,9 @@ async function handleInput(text){
     chatHistory.pop();
   }
   addLine('');
+  } // end streamDirect
+
+  await streamDirect();
 }
 
 function showBanner(){
@@ -532,6 +582,11 @@ function showBanner(){
   addLine('');
   addLine('  ──────────────────────────────────────','line-dim');
   addLine('  type / for commands','line-dim');
+  if(useBackend){
+    addLine('  web search enabled via PicoClaw','line-dim');
+  } else {
+    addLine('  no web search — run server.py to enable','line-dim');
+  }
   addLine('');
 }
 
@@ -545,6 +600,16 @@ async function boot(){
   await new Promise(r=>setTimeout(r,200));
   addLine('  Model: Qwen3.5-9B (5.28 GB) ✓','line-dim');
   await new Promise(r=>setTimeout(r,200));
+
+  // Detect backend
+  try{
+    const res=await fetch(BACKEND_URL+'/api/agent',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:'ping',session:'boot'}),signal:AbortSignal.timeout(3000)});
+    if(res.ok){useBackend=true;addLine('  Agent: PicoClaw ✓ (web search enabled)','line-dim');}
+    else{addLine('  Agent: not available (no web search)','line-dim');}
+  }catch(e){addLine('  Agent: not available (no web search)','line-dim');}
+  await new Promise(r=>setTimeout(r,200));
+
   addLine('  Server: localhost:8000 ✓','line-dim');
   await new Promise(r=>setTimeout(r,400));
   terminal.innerHTML='';
