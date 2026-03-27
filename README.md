@@ -1,30 +1,45 @@
 # 🍎 mac code
 
-**35B MoE agent at 30 tok/s. 32B dense model streamed from SSD. $0/month.**
+**22 GB model on a 16 GB Mac. 1.42 GB RAM. Coherent 35B reasoning. $0/month.**
 
 ---
 
 ## What This Does
 
-Runs large language models locally on Apple Silicon Macs. Two approaches:
+Runs models that **don't fit in RAM** on Apple Silicon Macs — no quality compromise, no mmap thrashing.
 
-**1. MoE Agent (fast, daily driver):** Qwen3.5-35B-A3B — a 35B Mixture-of-Experts model that activates only 3B parameters per token. At IQ2_M quantization (10.6 GB), llama.cpp handles the paging natively through macOS unified memory. Result: 30 tok/s with web search, shell commands, and file tools.
+**1. MoE Expert Sniper (the breakthrough):** Qwen3.5-35B-A3B at full Q4_K_M quality (22 GB) on a 16 GB Mac with only **1.42 GB of RAM**. The router predicts which 8 of 256 experts activate per token — we snipe only those from SSD via `F_NOCACHE` direct I/O with 8-thread parallel `pread`. The rest stays on disk. Result: coherent chain-of-thought reasoning at 1.54 tok/s.
 
-**2. Flash Streaming (research, out-of-core inference):** Qwen3-32B at full 4-bit quality (18.4 GB) on a 16 GB Mac. The model genuinely does not fit in RAM. We split it: attention weights pinned in 4.5 GB of RAM, FFN weights (14.2 GB) streamed from SSD per token via `F_NOCACHE` direct I/O. Result: 0.15 tok/s with full quality — 9x faster than naive mmap thrashing.
+```
+> what is 2+2?
 
-**3. Tool calling at 2.6 bits per weight.** At IQ2_M quantization, JSON function calls break. Instead, the LLM classifies its own intent as plain text — "search" / "shell" / "chat" — and routes itself. 8/8 correct on our test suite.
+Thinking Process:
+1. Analyze the Request: basic addition (2 + 2).
+2. Determine the Answer: 2 + 2 = 4.
+3. Self-Correction: The prompt asks for concise. A direct answer is best.
 
-**4. 64K context via KV cache quantization.** Two llama.cpp flags (`--cache-type-k q4_0 --cache-type-v q4_0`) shrink KV cache from 1024 MB to 288 MB. The 9B goes from 32K to 64K context with negligible quality loss.
+2 + 2 equals 4.
 
-| | **35B MoE (default)** | **9B (extended context)** | **32B Flash Stream** |
-|---|---|---|---|
-| **Backend** | llama.cpp | llama.cpp or MLX | Custom MLX engine |
-| **Speed** | 30 tok/s | 16-20 tok/s | 0.15 tok/s |
-| **Context** | 12K | 64K (KV cache quantized) | ~500 tokens (SSD-bound) |
-| **Size** | 10.6 GB (IQ2_M, 2.6 bpw) | 5.3 GB (Q4_K_M) | 18.4 GB (4-bit, full quality) |
-| **Memory** | 10.6 GB (MoE, 3B active) | Fits in RAM | **4.5 GB pinned** (14.2 GB on SSD) |
-| **Quality** | Good (MoE routing preserves coherence) | Full | Full 4-bit (no compression) |
-| **Best for** | Daily agent, reasoning | Long context, persistent memory | Proof of out-of-core inference |
+1.54 tok/s · 170 tokens · 1.42 GB RAM
+```
+
+**2. MoE Agent (fast, daily driver):** Same Qwen3.5-35B-A3B at IQ2_M (10.6 GB) via llama.cpp. Fits in RAM natively. 30 tok/s with web search, shell commands, and file tools.
+
+**3. Dense Flash Streaming (research proof):** Qwen3-32B at 4-bit (18.4 GB) streamed from SSD. 4.5 GB pinned, 14.2 GB FFN per token via `F_NOCACHE`. 0.15 tok/s — 9x faster than mmap thrashing. Produced 387 tokens of coherent chain-of-thought.
+
+**4. Tool calling at 2.6 bits per weight.** LLM classifies its own intent as plain text — "search" / "shell" / "chat" — and routes itself. 8/8 correct.
+
+**5. 64K context via KV cache quantization.** Two llama.cpp flags shrink KV cache from 1024 MB to 288 MB. The 9B goes from 32K to 64K context.
+
+| | **35B Expert Sniper** | **35B MoE (fast)** | **9B (long context)** | **32B Dense Stream** |
+|---|---|---|---|---|
+| **Backend** | Custom MLX + SSD | llama.cpp | llama.cpp or MLX | Custom MLX + SSD |
+| **Speed** | 1.54 tok/s | 30 tok/s | 16-20 tok/s | 0.15 tok/s |
+| **Model size** | 22 GB (Q4_K_M) | 10.6 GB (IQ2_M) | 5.3 GB (Q4_K_M) | 18.4 GB (4-bit) |
+| **RAM used** | **1.42 GB** | 10.6 GB | Fits in RAM | 4.5 GB |
+| **Quality** | Full Q4 + CoT | Good (2.6 bpw) | Full | Full 4-bit |
+| **Fits in 16 GB?** | NO (22 GB) | YES | YES | NO (18.4 GB) |
+| **Best for** | High-quality reasoning | Fast daily agent | Long context | Dense model proof |
 
 ---
 
