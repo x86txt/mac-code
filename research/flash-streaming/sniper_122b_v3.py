@@ -347,16 +347,20 @@ def main():
     vram = torch.cuda.memory_allocated() / 1e9
     print(f"  Loaded: {loaded}, Skipped: {skipped}, VRAM: {vram:.2f} GB [{time.time()-t0:.1f}s]")
 
-    # Validation: check a few critical weights
+    # Validation: check critical weights INCLUDING gate
     for check_name in [
         "model.layers.0.linear_attn.in_proj_qkv.weight",
         "model.layers.3.self_attn.q_proj.weight",
         "model.embed_tokens.weight",
         "lm_head.weight",
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.3.mlp.gate.weight",
     ]:
         param = dict(model.named_parameters()).get(check_name)
         if param is not None:
-            print(f"    CHECK {check_name}: {param.shape} {param.dtype} {param.device}")
+            std = param.float().std().item()
+            status = "OK" if std > 0.0001 else "ZEROS!"
+            print(f"    CHECK {check_name}: {param.shape} {param.dtype} {param.device} std={std:.6f} {status}")
         else:
             print(f"    CHECK {check_name}: NOT FOUND")
 
